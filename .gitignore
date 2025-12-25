@@ -1,0 +1,7 @@
+/__pycache__
+/data/bookDepth/*
+/data/metrics/*
+/data/trades/*
+*.npy
+*.json
+/processed/BTCUSDT/replay_memmap/*
