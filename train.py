@@ -38,79 +38,58 @@ def select_action(actor: ActorNet, obs, device: str, deterministic: bool = False
 
 
 def load_batch_s_and_ns(stores, i_arr, seq_len):
+    i_arr = np.asarray(i_arr, dtype=np.int64)
     b = len(i_arr)
-
-    d250 = stores["250ms"].d
-    d20 = stores["20s"].d
-    d5m = stores["5m"].d
-    d1h = stores["1h"].d
-
-    s250 = np.empty((b, seq_len, d250), dtype=np.float32)
-    s20 = np.empty((b, seq_len, d20), dtype=np.float32)
-    s5m = np.empty((b, seq_len, d5m), dtype=np.float32)
-    s1h = np.empty((b, seq_len, d1h), dtype=np.float32)
-
-    ns250 = np.empty_like(s250)
-    ns20 = np.empty_like(s20)
-    ns5m = np.empty_like(s5m)
-    ns1h = np.empty_like(s1h)
 
     base = stores["250ms"]
     s20s = stores["20s"]
     s5s = stores["5m"]
     s1s = stores["1h"]
 
+    base_first = int(base.first_ts)
     base_dt = int(base.interval_ms)
-    f20 = int(s20s.first_ts)
-    f5 = int(s5s.first_ts)
-    f1 = int(s1s.first_ts)
-    dt20 = int(s20s.interval_ms)
-    dt5 = int(s5s.interval_ms)
-    dt1 = int(s1s.interval_ms)
 
-    for k in range(b):
-        i = int(i_arr[k])
-        t_ms = base.ts_of_idx(i)
-        t_next = t_ms + base_dt
+    t = base_first + i_arr * base_dt
+    t_next = t + base_dt
 
-        i20 = int((t_ms - f20) // dt20)
-        i5 = int((t_ms - f5) // dt5)
-        i1 = int((t_ms - f1) // dt1)
+    i20 = ((t - int(s20s.first_ts)) // int(s20s.interval_ms)).astype(np.int64)
+    i5  = ((t - int(s5s.first_ts))  // int(s5s.interval_ms)).astype(np.int64)
+    i1  = ((t - int(s1s.first_ts))  // int(s1s.interval_ms)).astype(np.int64)
 
-        i20n = int((t_next - f20) // dt20)
-        i5n = int((t_next - f5) // dt5)
-        i1n = int((t_next - f1) // dt1)
+    i20n = ((t_next - int(s20s.first_ts)) // int(s20s.interval_ms)).astype(np.int64)
+    i5n  = ((t_next - int(s5s.first_ts))  // int(s5s.interval_ms)).astype(np.int64)
+    i1n  = ((t_next - int(s1s.first_ts))  // int(s1s.interval_ms)).astype(np.int64)
 
-        s250[k] = stores["250ms"].get_seq_end(i, seq_len)
-        s20[k] = stores["20s"].get_seq_end(i20, seq_len)
-        s5m[k] = stores["5m"].get_seq_end(i5, seq_len)
-        s1h[k] = stores["1h"].get_seq_end(i1, seq_len)
+    s250 = base.get_seqs_end_batch(i_arr, seq_len)
+    s20  = s20s.get_seqs_end_batch(i20, seq_len)
+    s5m  = s5s.get_seqs_end_batch(i5, seq_len)
+    s1h  = s1s.get_seqs_end_batch(i1, seq_len)
 
-        ni = i + 1
-        _, r250 = stores["250ms"].get_row(ni)
-        ns250[k, :-1] = s250[k, 1:]
-        ns250[k, -1] = r250
+    ns250 = np.empty_like(s250)
+    ns20  = np.empty_like(s20)
+    ns5m  = np.empty_like(s5m)
+    ns1h  = np.empty_like(s1h)
 
-        if i20n == i20:
-            ns20[k] = s20[k]
-        else:
-            _, r20 = stores["20s"].get_row(i20n)
-            ns20[k, :-1] = s20[k, 1:]
-            ns20[k, -1] = r20
+    ns250[:, :-1] = s250[:, 1:]
+    ns250[:, -1] = base.get_rows_batch(i_arr + 1)
 
-        if i5n == i5:
-            ns5m[k] = s5m[k]
-        else:
-            _, r5 = stores["5m"].get_row(i5n)
-            ns5m[k, :-1] = s5m[k, 1:]
-            ns5m[k, -1] = r5
+    ns20[:] = s20
+    ch = (i20n != i20)
+    if ch.any():
+        ns20[ch, :-1] = s20[ch, 1:]
+        ns20[ch, -1] = s20s.get_rows_batch(i20n[ch])
 
-        if i1n == i1:
-            ns1h[k] = s1h[k]
-        else:
-            _, r1 = stores["1h"].get_row(i1n)
-            ns1h[k, :-1] = s1h[k, 1:]
-            ns1h[k, -1] = r1
+    ns5m[:] = s5m
+    ch = (i5n != i5)
+    if ch.any():
+        ns5m[ch, :-1] = s5m[ch, 1:]
+        ns5m[ch, -1] = s5s.get_rows_batch(i5n[ch])
+
+    ns1h[:] = s1h
+    ch = (i1n != i1)
+    if ch.any():
+        ns1h[ch, :-1] = s1h[ch, 1:]
+        ns1h[ch, -1] = s1s.get_rows_batch(i1n[ch])
 
     return s250, s20, s5m, s1h, ns250, ns20, ns5m, ns1h
 

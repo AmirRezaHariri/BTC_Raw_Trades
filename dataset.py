@@ -187,6 +187,7 @@ class BookStream:
 # =========================
 # FEATURES
 # =========================
+
 def book_features_missing():
     bd = np.zeros(5, dtype=np.float32)
     ad = np.zeros(5, dtype=np.float32)

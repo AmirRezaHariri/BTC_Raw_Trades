@@ -80,6 +80,51 @@ class ScaleStore:
         need = seq_len - take1
         out[take1:] = Xe[:need]
         return out
+    
+    def _find_shards_batch(self, idxs: np.ndarray):
+        idxs = np.asarray(idxs, dtype=np.int64)
+        offs = np.asarray(self.offsets, dtype=np.int64)
+        si = np.searchsorted(offs, idxs, side="right") - 1
+        si = np.clip(si, 0, len(self.shards) - 1).astype(np.int64)
+        shard_offs = offs[si]
+        local = (idxs - shard_offs).astype(np.int64)
+        return si, local, shard_offs
+
+    def get_rows_batch(self, idxs: np.ndarray):
+        idxs = np.asarray(idxs, dtype=np.int64)
+        si, local, _ = self._find_shards_batch(idxs)
+        out = np.empty((len(idxs), self.d), dtype=np.float32)
+        for shard_i in np.unique(si):
+            m = (si == shard_i)
+            X = self._load_memmap(int(shard_i))
+            out[m] = X[local[m]]
+        return out
+
+    def get_seqs_end_batch(self, idxs_end: np.ndarray, seq_len: int):
+        idxs_end = np.asarray(idxs_end, dtype=np.int64)
+        b = len(idxs_end)
+        out = np.empty((b, seq_len, self.d), dtype=np.float32)
+
+        si, local_end, shard_offs = self._find_shards_batch(idxs_end)
+        ok = (local_end >= (seq_len - 1))
+
+        ar = np.arange(seq_len, dtype=np.int64)
+
+        if ok.any():
+            for shard_i in np.unique(si[ok]):
+                m = ok & (si == shard_i)
+                X = self._load_memmap(int(shard_i))
+                le = local_end[m]
+                ls = le - (seq_len - 1)
+                idx_mat = ls[:, None] + ar[None, :]
+                out[m] = X[idx_mat]
+
+        if (~ok).any():
+            bad = np.where(~ok)[0]
+            for k in bad:
+                out[k] = self.get_seq_end(int(idxs_end[k]), seq_len)
+
+        return out
 
 
 def find_first_idx_ge(store: ScaleStore, target_ms: int):
