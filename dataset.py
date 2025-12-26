@@ -2,10 +2,16 @@ import json
 import math
 from pathlib import Path
 import numpy as np
-from tqdm.notebook import tqdm
+import bisect
+from collections import deque
 
 from config import *
 from utils import *
+
+if NOTEBOOK:
+    from tqdm.notebook import tqdm
+else:
+    from tqdm import tqdm
 
 
 # =========================
@@ -756,3 +762,145 @@ def prepare_dataset():
         json.dump(meta, f, indent=2)
 
     print("done prepare:", OUT_ROOT.as_posix())
+
+
+# =========================
+# MEMMAP STORES
+# =========================
+class ScaleStore:
+    def __init__(self, scale_dir: Path):
+        with (scale_dir / "meta.json").open("r") as f:
+            self.meta = json.load(f)
+        self.scale = self.meta["scale"]
+        self.interval_ms = int(self.meta["interval_ms"])
+        self.d = int(self.meta["d"])
+        self.total_rows = int(self.meta["total_rows"])
+        self.first_ts = int(self.meta["first_ts"])
+        self.last_ts = int(self.meta["last_ts"])
+        self.shards = self.meta["shards"]
+        self.offsets = [int(s["offset"]) for s in self.shards] + [self.total_rows]
+
+        self._cache = {}
+        self._cache_order = deque()
+        self._cache_cap = 8
+
+    def ts_of_idx(self, idx: int) -> int:
+        return int(self.first_ts + int(idx) * int(self.interval_ms))
+
+    def _find_shard(self, idx: int):
+        i = bisect.bisect_right(self.offsets, idx) - 1
+        i = max(0, min(i, len(self.shards) - 1))
+        shard = self.shards[i]
+        base = int(shard["offset"])
+        local = idx - base
+        return i, local
+
+    def _load_memmap(self, shard_i: int):
+        if shard_i in self._cache:
+            return self._cache[shard_i]
+        shard = self.shards[shard_i]
+        X = np.load(shard["x"], mmap_mode="r")
+        self._cache[shard_i] = X
+
+        self._cache_order.append(shard_i)
+        while len(self._cache_order) > self._cache_cap:
+            old = self._cache_order.popleft()
+            if old in self._cache:
+                del self._cache[old]
+        return X
+
+    def get_row(self, idx: int):
+        shard_i, local = self._find_shard(idx)
+        X = self._load_memmap(shard_i)
+        return self.ts_of_idx(idx), X[local]
+
+    def get_seq_end(self, idx_end: int, seq_len: int):
+        start = idx_end - (seq_len - 1)
+        if start < 0:
+            raise IndexError("seq start < 0")
+
+        sh_e, lo_e = self._find_shard(idx_end)
+        sh_s, lo_s = self._find_shard(start)
+
+        if sh_s == sh_e:
+            X = self._load_memmap(sh_e)
+            return X[lo_s:lo_e + 1]
+
+        out = np.empty((seq_len, self.d), dtype=np.float32)
+
+        Xs = self._load_memmap(sh_s)
+        take1 = Xs.shape[0] - lo_s
+        if take1 > seq_len:
+            take1 = seq_len
+        out[:take1] = Xs[lo_s:lo_s + take1]
+
+        Xe = self._load_memmap(sh_e)
+        need = seq_len - take1
+        out[take1:] = Xe[:need]
+        return out
+    
+    def _find_shards_batch(self, idxs: np.ndarray):
+        idxs = np.asarray(idxs, dtype=np.int64)
+        offs = np.asarray(self.offsets, dtype=np.int64)
+        si = np.searchsorted(offs, idxs, side="right") - 1
+        si = np.clip(si, 0, len(self.shards) - 1).astype(np.int64)
+        shard_offs = offs[si]
+        local = (idxs - shard_offs).astype(np.int64)
+        return si, local, shard_offs
+
+    def get_rows_batch(self, idxs: np.ndarray):
+        idxs = np.asarray(idxs, dtype=np.int64)
+        si, local, _ = self._find_shards_batch(idxs)
+        out = np.empty((len(idxs), self.d), dtype=np.float32)
+        for shard_i in np.unique(si):
+            m = (si == shard_i)
+            X = self._load_memmap(int(shard_i))
+            out[m] = X[local[m]]
+        return out
+
+    def get_seqs_end_batch(self, idxs_end: np.ndarray, seq_len: int):
+        idxs_end = np.asarray(idxs_end, dtype=np.int64)
+        b = len(idxs_end)
+        out = np.empty((b, seq_len, self.d), dtype=np.float32)
+
+        si, local_end, shard_offs = self._find_shards_batch(idxs_end)
+        ok = (local_end >= (seq_len - 1))
+
+        ar = np.arange(seq_len, dtype=np.int64)
+
+        if ok.any():
+            for shard_i in np.unique(si[ok]):
+                m = ok & (si == shard_i)
+                X = self._load_memmap(int(shard_i))
+                le = local_end[m]
+                ls = le - (seq_len - 1)
+                idx_mat = ls[:, None] + ar[None, :]
+                out[m] = X[idx_mat]
+
+        if (~ok).any():
+            bad = np.where(~ok)[0]
+            for k in bad:
+                out[k] = self.get_seq_end(int(idxs_end[k]), seq_len)
+
+        return out
+
+
+def find_first_idx_ge(store: ScaleStore, target_ms: int):
+    lo = 0
+    hi = store.total_rows - 1
+    ans = store.total_rows
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        ts, _ = store.get_row(mid)
+        if ts >= target_ms:
+            ans = mid
+            hi = mid - 1
+        else:
+            lo = mid + 1
+    return ans
+
+
+def map_base_ts_to_scale_idx(scale_store: ScaleStore, t_ms: int):
+    if t_ms < scale_store.first_ts:
+        return -1
+    return int((int(t_ms) - int(scale_store.first_ts)) // int(scale_store.interval_ms))

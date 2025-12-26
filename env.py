@@ -1,151 +1,10 @@
 import numpy as np
 from collections import deque
 import json
-import bisect
 
 from config import *
+from dataset import *
 
-
-# =========================
-# MEMMAP STORES
-# =========================
-class ScaleStore:
-    def __init__(self, scale_dir: Path):
-        with (scale_dir / "meta.json").open("r") as f:
-            self.meta = json.load(f)
-        self.scale = self.meta["scale"]
-        self.interval_ms = int(self.meta["interval_ms"])
-        self.d = int(self.meta["d"])
-        self.total_rows = int(self.meta["total_rows"])
-        self.first_ts = int(self.meta["first_ts"])
-        self.last_ts = int(self.meta["last_ts"])
-        self.shards = self.meta["shards"]
-        self.offsets = [int(s["offset"]) for s in self.shards] + [self.total_rows]
-
-        self._cache = {}
-        self._cache_order = deque()
-        self._cache_cap = 8
-
-    def ts_of_idx(self, idx: int) -> int:
-        return int(self.first_ts + int(idx) * int(self.interval_ms))
-
-    def _find_shard(self, idx: int):
-        i = bisect.bisect_right(self.offsets, idx) - 1
-        i = max(0, min(i, len(self.shards) - 1))
-        shard = self.shards[i]
-        base = int(shard["offset"])
-        local = idx - base
-        return i, local
-
-    def _load_memmap(self, shard_i: int):
-        if shard_i in self._cache:
-            return self._cache[shard_i]
-        shard = self.shards[shard_i]
-        X = np.load(shard["x"], mmap_mode="r")
-        self._cache[shard_i] = X
-
-        self._cache_order.append(shard_i)
-        while len(self._cache_order) > self._cache_cap:
-            old = self._cache_order.popleft()
-            if old in self._cache:
-                del self._cache[old]
-        return X
-
-    def get_row(self, idx: int):
-        shard_i, local = self._find_shard(idx)
-        X = self._load_memmap(shard_i)
-        return self.ts_of_idx(idx), X[local]
-
-    def get_seq_end(self, idx_end: int, seq_len: int):
-        start = idx_end - (seq_len - 1)
-        if start < 0:
-            raise IndexError("seq start < 0")
-
-        sh_e, lo_e = self._find_shard(idx_end)
-        sh_s, lo_s = self._find_shard(start)
-
-        if sh_s == sh_e:
-            X = self._load_memmap(sh_e)
-            return X[lo_s:lo_e + 1]
-
-        out = np.empty((seq_len, self.d), dtype=np.float32)
-
-        Xs = self._load_memmap(sh_s)
-        take1 = Xs.shape[0] - lo_s
-        if take1 > seq_len:
-            take1 = seq_len
-        out[:take1] = Xs[lo_s:lo_s + take1]
-
-        Xe = self._load_memmap(sh_e)
-        need = seq_len - take1
-        out[take1:] = Xe[:need]
-        return out
-    
-    def _find_shards_batch(self, idxs: np.ndarray):
-        idxs = np.asarray(idxs, dtype=np.int64)
-        offs = np.asarray(self.offsets, dtype=np.int64)
-        si = np.searchsorted(offs, idxs, side="right") - 1
-        si = np.clip(si, 0, len(self.shards) - 1).astype(np.int64)
-        shard_offs = offs[si]
-        local = (idxs - shard_offs).astype(np.int64)
-        return si, local, shard_offs
-
-    def get_rows_batch(self, idxs: np.ndarray):
-        idxs = np.asarray(idxs, dtype=np.int64)
-        si, local, _ = self._find_shards_batch(idxs)
-        out = np.empty((len(idxs), self.d), dtype=np.float32)
-        for shard_i in np.unique(si):
-            m = (si == shard_i)
-            X = self._load_memmap(int(shard_i))
-            out[m] = X[local[m]]
-        return out
-
-    def get_seqs_end_batch(self, idxs_end: np.ndarray, seq_len: int):
-        idxs_end = np.asarray(idxs_end, dtype=np.int64)
-        b = len(idxs_end)
-        out = np.empty((b, seq_len, self.d), dtype=np.float32)
-
-        si, local_end, shard_offs = self._find_shards_batch(idxs_end)
-        ok = (local_end >= (seq_len - 1))
-
-        ar = np.arange(seq_len, dtype=np.int64)
-
-        if ok.any():
-            for shard_i in np.unique(si[ok]):
-                m = ok & (si == shard_i)
-                X = self._load_memmap(int(shard_i))
-                le = local_end[m]
-                ls = le - (seq_len - 1)
-                idx_mat = ls[:, None] + ar[None, :]
-                out[m] = X[idx_mat]
-
-        if (~ok).any():
-            bad = np.where(~ok)[0]
-            for k in bad:
-                out[k] = self.get_seq_end(int(idxs_end[k]), seq_len)
-
-        return out
-
-
-def find_first_idx_ge(store: ScaleStore, target_ms: int):
-    lo = 0
-    hi = store.total_rows - 1
-    ans = store.total_rows
-    while lo <= hi:
-        mid = (lo + hi) // 2
-        ts, _ = store.get_row(mid)
-        if ts >= target_ms:
-            ans = mid
-            hi = mid - 1
-        else:
-            lo = mid + 1
-    return ans
-
-
-def map_base_ts_to_scale_idx(scale_store: ScaleStore, t_ms: int):
-    if t_ms < scale_store.first_ts:
-        return -1
-    return int((int(t_ms) - int(scale_store.first_ts)) // int(scale_store.interval_ms))
 
 # =========================
 # ENVIRONMENT
@@ -160,8 +19,12 @@ def vote_exec_action(vote_deque: deque, last_exec: int):
         return cands[0]
     if int(last_exec) in cands:
         return int(last_exec)
-    return 0
-
+    # tie break: most recent among tied candidates (not HOLD by default)
+    for a in reversed(vote_deque):
+        aa = int(a)
+        if aa in cands:
+            return aa
+    return int(last_exec)
 
 class TradingEnv:
     def __init__(self, stores, norm, close_idx_in_x250: int, device: str, torch_obs: bool = True):
@@ -245,8 +108,9 @@ class TradingEnv:
         buf[-1] = row
 
     def _shift_append_torch(self, tbuf: torch.Tensor, row_np: np.ndarray):
-        tbuf.copy_(torch.roll(tbuf, shifts=-1, dims=1))
-        tbuf[:, -1] = torch.from_numpy(row_np).to(self.device, dtype=DTYPE)
+        tbuf[:, :-1].copy_(tbuf[:, 1:].clone())
+        trow = torch.from_numpy(row_np).to(self.device, dtype=DTYPE).view(1, 1, -1)
+        tbuf[:, -1:].copy_(trow)
 
     def reset(self, start_i):
         self.i = int(start_i)
@@ -291,9 +155,15 @@ class TradingEnv:
 
         bal_start = float(self.balance)
 
-        self.vote.append(action_proposed)
-        exec_a = vote_exec_action(self.vote, self.last_exec)
+        use_vote = USE_VOTE_FILTER_TRAIN if MODE == "train" else USE_VOTE_FILTER_EVAL
+
+        if use_vote:
+            exec_a = vote_exec_action(self.vote, self.last_exec)  
+        else:
+            exec_a = int(action_proposed)                         
+
         self.last_exec = int(exec_a)
+        self.vote.append(int(action_proposed))                    
 
         _, x_row = self.stores["250ms"].get_row(self.i)
         price_now = self._get_price(x_row)
@@ -327,7 +197,7 @@ class TradingEnv:
                 self.balance *= self._fee_mult(FEE_CLOSE)
                 self.pos = 0
             self.balance = max(0.0, float(self.balance))
-            reward = float(self.balance - bal_start)
+            reward = float((self.balance - bal_start) / (bal_start + EPS))
             self.i = self.stores["250ms"].total_rows - 1
             self.done = True
             info = {"balance": float(self.balance), "pos": int(self.pos), "exec_action": int(self.last_exec)}
@@ -346,7 +216,7 @@ class TradingEnv:
             self.balance = bal_mid + pnl
 
         self.balance = max(0.0, float(self.balance))
-        reward = float(self.balance - bal_start)
+        reward = float((self.balance - bal_start) / (bal_start + EPS))
 
         self.i = next_i
         self.step_i += 1
@@ -420,18 +290,33 @@ class ReplayBuffer:
         def mm(path: Path, dtype, shape, mode):
             return np.memmap(str(path), dtype=dtype, mode=mode, shape=shape)
 
+        def wipe_dir():
+            for name in ["i.dat", "a.dat", "r.dat", "d.dat", "ctx.dat", "nctx.dat", "replay_meta.json"]:
+                p = self.replay_dir / name
+                if p.exists():
+                    try:
+                        p.unlink()
+                    except Exception:
+                        pass
+
+        mode = "w+"
+        self.ptr = 0
+        self.size = 0
+
         if self.meta_path.exists():
-            with self.meta_path.open("r") as f:
-                meta = json.load(f)
-            if int(meta["cap"]) != self.cap or int(meta["ctx_dim"]) != self.ctx_dim:
-                raise RuntimeError("Replay memmap shape mismatch")
-            self.ptr = int(meta["ptr"])
-            self.size = int(meta["size"])
-            mode = "r+"
-        else:
-            self.ptr = 0
-            self.size = 0
-            mode = "w+"
+            try:
+                with self.meta_path.open("r") as f:
+                    meta = json.load(f)
+                cap_ok = int(meta.get("cap", -1)) == self.cap
+                ctx_ok = int(meta.get("ctx_dim", -1)) == self.ctx_dim
+                if cap_ok and ctx_ok:
+                    self.ptr = int(meta.get("ptr", 0))
+                    self.size = int(meta.get("size", 0))
+                    mode = "r+"
+                else:
+                    wipe_dir()
+            except Exception:
+                wipe_dir()
 
         self.i = mm(self.replay_dir / "i.dat", np.int64, (self.cap,), mode)
         self.a = mm(self.replay_dir / "a.dat", np.int64, (self.cap,), mode)

@@ -1,15 +1,22 @@
 import json
-
+import time
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.data import IterableDataset, DataLoader, get_worker_info
+import multiprocessing as mp
 
 from config import *
 from utils import *
 from model import *
 from dataset import *
 from env import *
+
+if NOTEBOOK:
+    from tqdm.notebook import tqdm
+else:
+    from tqdm import tqdm
 
 
 # =========================
@@ -124,6 +131,93 @@ def evaluate_policy(actor: nn.Module, stores, norm, start_lo: int, start_hi: int
     return {"steps": int(steps), "episodes": int(ep), "avg_reward_per_step": float(avg_r_step), "avg_final_balance": float(avg_bal)}
 
 
+class ReplayBatchIterable(IterableDataset):
+    def __init__(self, out_root: Path, replay_dir: Path, ctx_dim: int, batch_size: int, seq_len: int, rb_size_value):
+        super().__init__()
+        self.out_root = Path(out_root)
+        self.replay_dir = Path(replay_dir)
+        self.ctx_dim = int(ctx_dim)
+        self.batch_size = int(batch_size)
+        self.seq_len = int(seq_len)
+        self.rb_size_value = rb_size_value
+
+        self._inited = False
+        self.stores = None
+        self.cap = None
+
+        self.i = None
+        self.a = None
+        self.r = None
+        self.d = None
+        self.ctx = None
+        self.nctx = None
+
+    def _init_once(self):
+        if self._inited:
+            return
+
+        with (self.replay_dir / "replay_meta.json").open("r") as f:
+            meta = json.load(f)
+        self.cap = int(meta["cap"])
+
+        def mm(path: Path, dtype, shape):
+            return np.memmap(str(path), dtype=dtype, mode="r", shape=shape)
+
+        self.i = mm(self.replay_dir / "i.dat", np.int64, (self.cap,))
+        self.a = mm(self.replay_dir / "a.dat", np.int64, (self.cap,))
+        self.r = mm(self.replay_dir / "r.dat", np.float32, (self.cap,))
+        self.d = mm(self.replay_dir / "d.dat", np.float32, (self.cap,))
+        self.ctx = mm(self.replay_dir / "ctx.dat", np.float32, (self.cap, self.ctx_dim))
+        self.nctx = mm(self.replay_dir / "nctx.dat", np.float32, (self.cap, self.ctx_dim))
+
+        self.stores = {
+            "250ms": ScaleStore(self.out_root / "250ms"),
+            "20s": ScaleStore(self.out_root / "20s"),
+            "5m": ScaleStore(self.out_root / "5m"),
+            "1h": ScaleStore(self.out_root / "1h"),
+        }
+
+        self._inited = True
+
+    def __iter__(self):
+        self._init_once()
+        wi = get_worker_info()
+        wid = 0 if wi is None else int(wi.id)
+        rng = np.random.default_rng(SEED + 10007 * wid)
+
+        while True:
+            size = int(self.rb_size_value.value)
+            if size < self.batch_size:
+                time.sleep(0.01)
+                continue
+
+            ridx = rng.integers(0, size, size=self.batch_size, dtype=np.int64)
+
+            i_end = self.i[ridx].astype(np.int64, copy=False)
+            a = self.a[ridx].astype(np.int64, copy=False)
+            r = self.r[ridx].astype(np.float32, copy=False)
+            d = self.d[ridx].astype(np.float32, copy=False)
+            ctx = self.ctx[ridx].astype(np.float32, copy=False)
+            nctx = self.nctx[ridx].astype(np.float32, copy=False)
+
+            s250, s20, s5m, s1h, ns250, ns20, ns5m, ns1h = load_batch_s_and_ns(self.stores, i_end, self.seq_len)
+
+            yield (
+                torch.from_numpy(s250),
+                torch.from_numpy(s20),
+                torch.from_numpy(s5m),
+                torch.from_numpy(s1h),
+                torch.from_numpy(ns250),
+                torch.from_numpy(ns20),
+                torch.from_numpy(ns5m),
+                torch.from_numpy(ns1h),
+                torch.from_numpy(a),
+                torch.from_numpy(r),
+                torch.from_numpy(d),
+                torch.from_numpy(ctx),
+                torch.from_numpy(nctx),
+            )
+
 
 def train():
     seed_all(SEED)
@@ -153,6 +247,22 @@ def train():
     ctx_dim = 2 + N_ACTIONS + (VOTE_N * N_ACTIONS)
 
     rb = ReplayBuffer(REPLAY_CAP, ctx_dim, REPLAY_DIR)
+    rb_size_value = mp.Value("i", 0)
+    rb_size_value.value = int(rb.size)
+
+    def make_loader():
+        ds = ReplayBatchIterable(OUT_ROOT, REPLAY_DIR, ctx_dim, BATCH_SIZE, SEQ_LEN, rb_size_value)
+        return DataLoader(
+            ds,
+            batch_size=None,
+            num_workers=NUM_WORKERS,
+            pin_memory=PIN_MEMORY,
+            prefetch_factor=PREFETCH_FACTOR if NUM_WORKERS > 0 else None,
+            persistent_workers=PERSISTENT_WORKERS if NUM_WORKERS > 0 else False,
+        )
+
+    batch_loader = make_loader()
+    batch_iter = iter(batch_loader)
 
     actor = ActorNet(stores["250ms"].d, stores["20s"].d, stores["5m"].d, stores["1h"].d, ctx_dim).to(DEVICE)
     critic = CriticNet(stores["250ms"].d, stores["20s"].d, stores["5m"].d, stores["1h"].d, ctx_dim).to(DEVICE)
@@ -211,37 +321,34 @@ def train():
                 p_t.data.mul_(1.0 - tau).add_(p.data, alpha=tau)
 
     def update_step():
-        i, a, r, d, ctx, nctx = rb.sample(BATCH_SIZE)
-        i = i.astype(np.int64, copy=False)
+        batch = next(batch_iter)
+        (s250, s20, s5m, s1h, ns250, ns20, ns5m, ns1h, a, r, d, ctx, nctx) = batch
 
-        s250, s20, s5m, s1h, ns250, ns20, ns5m, ns1h = load_batch_s_and_ns(stores, i, SEQ_LEN)
+        s250 = s250.to(DEVICE, dtype=torch.float32, non_blocking=True)
+        s20  = s20.to(DEVICE, dtype=torch.float32, non_blocking=True)
+        s5m  = s5m.to(DEVICE, dtype=torch.float32, non_blocking=True)
+        s1h  = s1h.to(DEVICE, dtype=torch.float32, non_blocking=True)
 
-        s250 = torch.from_numpy(s250).to(DEVICE, dtype=torch.float32)
-        s20 = torch.from_numpy(s20).to(DEVICE, dtype=torch.float32)
-        s5m = torch.from_numpy(s5m).to(DEVICE, dtype=torch.float32)
-        s1h = torch.from_numpy(s1h).to(DEVICE, dtype=torch.float32)
+        ns250 = ns250.to(DEVICE, dtype=torch.float32, non_blocking=True)
+        ns20  = ns20.to(DEVICE, dtype=torch.float32, non_blocking=True)
+        ns5m  = ns5m.to(DEVICE, dtype=torch.float32, non_blocking=True)
+        ns1h  = ns1h.to(DEVICE, dtype=torch.float32, non_blocking=True)
 
-        ns250 = torch.from_numpy(ns250).to(DEVICE, dtype=torch.float32)
-        ns20 = torch.from_numpy(ns20).to(DEVICE, dtype=torch.float32)
-        ns5m = torch.from_numpy(ns5m).to(DEVICE, dtype=torch.float32)
-        ns1h = torch.from_numpy(ns1h).to(DEVICE, dtype=torch.float32)
-
-        ctx = torch.from_numpy(ctx).to(DEVICE, dtype=torch.float32)
-        nctx = torch.from_numpy(nctx).to(DEVICE, dtype=torch.float32)
+        a   = a.to(DEVICE, dtype=torch.long, non_blocking=True)
+        r   = r.to(DEVICE, dtype=torch.float32, non_blocking=True)
+        d   = d.to(DEVICE, dtype=torch.float32, non_blocking=True)
+        ctx = ctx.to(DEVICE, dtype=torch.float32, non_blocking=True)
+        nctx = nctx.to(DEVICE, dtype=torch.float32, non_blocking=True)
 
         s250 = norm_t("250ms", s250)
-        s20 = norm_t("20s", s20)
-        s5m = norm_t("5m", s5m)
-        s1h = norm_t("1h", s1h)
+        s20  = norm_t("20s", s20)
+        s5m  = norm_t("5m", s5m)
+        s1h  = norm_t("1h", s1h)
 
         ns250 = norm_t("250ms", ns250)
-        ns20 = norm_t("20s", ns20)
-        ns5m = norm_t("5m", ns5m)
-        ns1h = norm_t("1h", ns1h)
-
-        a = torch.from_numpy(a).to(DEVICE, dtype=torch.long)
-        r = torch.from_numpy(r).to(DEVICE, dtype=torch.float32)
-        d = torch.from_numpy(d).to(DEVICE, dtype=torch.float32)
+        ns20  = norm_t("20s", ns20)
+        ns5m  = norm_t("5m", ns5m)
+        ns1h  = norm_t("1h", ns1h)
 
         alpha_det = log_alpha.exp().detach()
 
@@ -255,12 +362,8 @@ def train():
                 p_n = torch.exp(logp_n)
 
                 tq1, tq2 = critic_tgt(ns250, ns20, ns5m, ns1h, nctx)
-                tq = torch.min(tq1, tq2)
-                tq = tq.float()
-                logp_n_f = logp_n.float()
-                p_n_f = p_n.float()
-
-                v = (p_n_f * (tq - alpha_det * logp_n_f)).sum(dim=-1)
+                tq = torch.min(tq1, tq2).float()
+                v = (p_n.float() * (tq - alpha_det * logp_n.float())).sum(dim=-1)
                 y = r + (1.0 - d) * float(GAMMA) * v
 
             q1, q2 = critic(s250, s20, s5m, s1h, ctx)
@@ -284,9 +387,7 @@ def train():
                 q1p, q2p = critic(s250, s20, s5m, s1h, ctx)
                 qmin = torch.min(q1p, q2p).float()
 
-            logp_f = logp.float()
-            p_f = p.float()
-            actor_loss = (p_f * (alpha_det * logp_f - qmin)).sum(dim=-1).mean()
+            actor_loss = (p.float() * (alpha_det * logp.float() - qmin)).sum(dim=-1).mean()
 
         opt_actor.zero_grad(set_to_none=True)
         actor_loss.backward()
@@ -393,6 +494,7 @@ def train():
             steps_in_ep += 1
 
             if rb.size >= BATCH_SIZE and global_step >= WARMUP_STEPS and (global_step % UPDATE_EVERY) == 0:
+                rb_size_value.value = int(rb.size)
                 for _ in range(UPDATES_PER_STEP):
                     cl, al, ent, alp = update_step()
                     ep_c += cl
