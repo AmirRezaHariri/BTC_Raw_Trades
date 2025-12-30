@@ -3,6 +3,7 @@ import math
 from pathlib import Path
 import numpy as np
 import bisect
+import csv
 from collections import deque
 
 from config import *
@@ -425,7 +426,7 @@ class CoarseAgg:
         self.book_sum = np.zeros(self.book_d, dtype=np.float64)
         self.book_last = np.zeros(self.book_d, dtype=np.float32)
 
-    def update_from_base(self, base_trade, base_book_feats, base_logret):
+    def update_from_base(self, base_trade, base_book_feats):
         o = float(base_trade[5])
         h = float(base_trade[6])
         l = float(base_trade[7])
@@ -450,7 +451,8 @@ class CoarseAgg:
         self.n_trades += int(base_trade[1])
         self.buy_qty += float(base_trade[11])
         self.sell_qty += float(base_trade[12])
-        self.sum_logret_sq += float(base_logret) * float(base_logret)
+        lr = float(base_trade[9])
+        self.sum_logret_sq += lr * lr
 
         bf = base_book_feats.astype(np.float32)
         self.book_last = bf
@@ -697,9 +699,9 @@ def prepare_dataset():
         x250 = make_feature_vector(trade_feats, book_feats)
         writers["250ms"].add(bin_end, x250)
 
-        agg20.update_from_base(trade_feats, book_feats, base_logret)
-        agg5m.update_from_base(trade_feats, book_feats, base_logret)
-        agg1h.update_from_base(trade_feats, book_feats, base_logret)
+        agg20.update_from_base(trade_feats, book_feats)
+        agg5m.update_from_base(trade_feats, book_feats)
+        agg1h.update_from_base(trade_feats, book_feats)
 
         if bin_end == next_end_20:
             x20 = agg20.flush()

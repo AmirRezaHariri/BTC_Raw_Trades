@@ -31,6 +31,14 @@ def build_signature(stores: dict, ctx_dim: int) -> dict:
         "n_actions": int(N_ACTIONS),
         "vote_n": int(VOTE_N),
         "dtype": str(DTYPE),
+        "env": {
+            "min_hold_steps": int(MIN_HOLD_STEPS),
+            "cooldown_steps": int(COOLDOWN_STEPS),
+            "trade_penalty_entry": float(TRADE_PENALTY_ENTRY),
+            "idle_penalty_base": float(IDLE_PENALTY_BASE),
+            "after_steps": int(IDLE_PENALTY_AFTER_STEPS),
+            "base": float(IDLE_PENALTY_BASE),
+        },
         "model": {
             "hidden": int(HIDDEN),
             "enc_hidden": int(ENC_HIDDEN),
@@ -401,8 +409,7 @@ def train():
 
         ent = -(p.float() * logp.float()).sum(dim=-1).mean()
 
-        alpha = log_alpha.exp()
-        alpha_loss = alpha * (ent.detach() - float(TARGET_ENTROPY))
+        alpha_loss = -(log_alpha * (ent.detach() - float(TARGET_ENTROPY)))
 
         opt_alpha.zero_grad(set_to_none=True)
         alpha_loss.backward()
@@ -503,10 +510,12 @@ def train():
             cur_i = env.i
 
             next_obs, rwd, done, info = env.step(a_prop)
+            exec_a = int(info.get("exec_action", int(a_prop)))
 
             nctx = next_obs["ctx"].copy()
 
-            rb.add(cur_i, int(a_prop), float(rwd), float(done), ctx, nctx)
+            rb.add(cur_i, exec_a, float(rwd), float(done), ctx, nctx)
+            rb_size_value.value = int(rb.size)
 
             ep_reward += float(rwd)
             global_step += 1
@@ -514,7 +523,6 @@ def train():
 
             if rb.size >= BATCH_SIZE and global_step >= WARMUP_STEPS and \
                                         (global_step % UPDATE_EVERY) == 0:
-                rb_size_value.value = int(rb.size)
                 for _ in range(UPDATES_PER_STEP):
                     out = update_step()
                     if out is None:

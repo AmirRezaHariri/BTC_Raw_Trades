@@ -22,8 +22,8 @@ class ScaleEncoder(nn.Module):
         self.pool2 = nn.AvgPool1d(kernel_size=2)
         self.drop = nn.Dropout(DROPOUT)
 
-        self.flat_dim = self.hidden // 2 * self.seq_len // \
-                        (self.pool1.kernel_size[0] * self.pool2.kernel_size[0])
+        self.flat_t = self.seq_len // (self.pool1.kernel_size[0] * self.pool2.kernel_size[0])
+        self.flat_dim = (self.hidden // 2) * self.flat_t
         
         self.ln = nn.LayerNorm(self.flat_dim)
         self.emb1 = nn.Linear(self.flat_dim, ENC_HIDDEN)

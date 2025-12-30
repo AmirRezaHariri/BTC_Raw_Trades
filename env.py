@@ -1,4 +1,5 @@
 import numpy as np
+import math
 from collections import deque
 import torch
 
@@ -41,10 +42,18 @@ class TradingEnv:
         self.i = 0
         self.step_i = 0
         self.balance = float(INIT_BALANCE)
+        self.peak_balance = float(INIT_BALANCE)
         self.pos = 0
+        self.entry_price = 0.0
+        self.last_price = 0.0
+        self.pos_notional = 0.0
+        self.pos_qty = 0.0
+        self.entry_step_i = 0
+        self.cooldown_remaining = 0
         self.vote = deque(maxlen=VOTE_N)
         self.last_exec = 0
         self.done = False
+        self.flat_hold_steps = 0
 
         self.buf_250 = None
         self.buf_20 = None
@@ -70,8 +79,19 @@ class TradingEnv:
         return float(x250_row[self.close_idx])
 
     def _fee_mult(self, fee_rate: float):
-        m = 1.0 - float(fee_rate) * float(LEVERAGE)
-        return max(0.0, m)
+        return 1.0 - float(fee_rate)
+    
+    def _penalty_mult_entry(self):
+        x = 1.0 - float(TRADE_PENALTY_ENTRY)
+        if x < 0.0:
+            return 0.0
+        return x
+
+    def _can_close(self):
+        if self.pos == 0:
+            return False
+        held = int(self.step_i) - int(self.entry_step_i)
+        return held >= int(MIN_HOLD_STEPS)
     
     def _ctx_vec(self):
         last = np.zeros(N_ACTIONS, dtype=np.float32)
@@ -129,12 +149,20 @@ class TradingEnv:
         self.i = int(start_i)
         self.step_i = 0
         self.balance = float(INIT_BALANCE)
+        self.peak_balance = float(INIT_BALANCE)
         self.pos = 0
+        self.entry_price = 0.0
+        self.last_price = 0.0
+        self.pos_notional = 0.0
+        self.pos_qty = 0.0
+        self.entry_step_i = 0
+        self.cooldown_remaining = 0
         self.vote.clear()
         for _ in range(VOTE_N):
             self.vote.append(0)
         self.last_exec = 0
         self.done = False
+        self.flat_hold_steps = 0
 
         base_store = self.stores["250ms"]
         t_ms = base_store.ts_of_idx(self.i)
@@ -142,6 +170,8 @@ class TradingEnv:
         self.idx_20 = map_base_ts_to_scale_idx(self.stores["20s"], t_ms)
         self.idx_5m = map_base_ts_to_scale_idx(self.stores["5m"], t_ms)
         self.idx_1h = map_base_ts_to_scale_idx(self.stores["1h"], t_ms)
+        if self.idx_20 < (SEQ_LEN - 1) or self.idx_5m < (SEQ_LEN - 1) or self.idx_1h < (SEQ_LEN - 1):
+            raise IndexError("reset start_i too early for one or more scales (need >= SEQ_LEN-1 history)")
 
         x250 = self.stores["250ms"].get_seq_end(self.i, SEQ_LEN)
         x20 = self.stores["20s"].get_seq_end(self.idx_20, SEQ_LEN)
@@ -170,77 +200,97 @@ class TradingEnv:
 
         use_vote = USE_VOTE_FILTER_TRAIN if MODE == "train" else USE_VOTE_FILTER_EVAL
 
+        self.vote.append(int(action_proposed))
         if use_vote:
-            exec_a = vote_exec_action(self.vote, self.last_exec)  
+            exec_a = vote_exec_action(self.vote, self.last_exec)
         else:
-            exec_a = int(action_proposed)                         
-
-        self.last_exec = int(exec_a)
-        self.vote.append(int(action_proposed))                    
+            exec_a = int(action_proposed)   
 
         _, x_row = self.stores["250ms"].get_row(self.i)
         price_now = self._get_price(x_row)
 
+        bal_mid = float(self.balance)
+        if self.pos != 0 and self.last_price > 0:
+            pnl = self.pos_qty * self.pos * (price_now - self.last_price)
+            self.balance = bal_mid + pnl
+        self.last_price = price_now
+        if int(self.cooldown_remaining) > 0 and exec_a in (1, 2):
+            exec_a = 0
+
+        if self.pos == 1 and exec_a == 2:
+            exec_a = 3
+        if self.pos == -1 and exec_a == 1:
+            exec_a = 3
+
+        if exec_a == 3 and self.pos != 0 and (not self._can_close()):
+            exec_a = 0
+
+        if self.pos == 0 and exec_a == 0:
+            self.flat_hold_steps += 1
+        else:
+            self.flat_hold_steps = 0
+        self.last_exec = int(exec_a)
+        
         if exec_a == 1:
             if self.pos == 0:
                 self.balance *= self._fee_mult(FEE_OPEN)
+                self.balance *= self._penalty_mult_entry()
                 self.pos = 1
                 self.entry_price = price_now
-            elif self.pos == -1:
-                self.balance *= self._fee_mult(FEE_CLOSE)
-                self.balance *= self._fee_mult(FEE_OPEN)
-                self.pos = 1
-                self.entry_price = price_now
+                self.pos_notional = self.balance * float(LEVERAGE)
+                self.pos_qty = self.pos_notional / max(price_now, EPS)
+                self.entry_step_i = int(self.step_i)
 
         elif exec_a == 2:
             if self.pos == 0:
                 self.balance *= self._fee_mult(FEE_OPEN)
+                self.balance *= self._penalty_mult_entry()
                 self.pos = -1
                 self.entry_price = price_now
-            elif self.pos == 1:
-                self.balance *= self._fee_mult(FEE_CLOSE)
-                self.balance *= self._fee_mult(FEE_OPEN)
-                self.pos = -1
-                self.entry_price = price_now
+                self.pos_notional = self.balance * float(LEVERAGE)
+                self.pos_qty = self.pos_notional / max(price_now, EPS)
+                self.entry_step_i = int(self.step_i)
 
         elif exec_a == 3:
             if self.pos != 0:
                 self.balance *= self._fee_mult(FEE_CLOSE)
                 self.pos = 0
                 self.entry_price = 0.0
+                self.pos_notional = 0.0
+                self.pos_qty = 0.0
+                self.cooldown_remaining = int(COOLDOWN_STEPS)
 
         next_i = self.i + 1
         if next_i >= self.stores["250ms"].total_rows:
+            done = True
             if self.pos != 0:
                 self.balance *= self._fee_mult(FEE_CLOSE)
                 self.pos = 0
+                self.entry_price = 0.0
+                self.pos_notional = 0.0
+                self.pos_qty = 0.0
             self.balance = max(0.0, float(self.balance))
-            reward = float((self.balance - bal_start) / (bal_start + EPS))
+            if self.balance > self.peak_balance:
+                self.peak_balance = self.balance
+            reward = float(math.log((self.balance + EPS) / (bal_start + EPS)))
             self.i = self.stores["250ms"].total_rows - 1
             self.done = True
             info = {"balance": float(self.balance), "pos": int(self.pos), 
-                    "exec_action": int(self.last_exec)}
-            if self.pos == 0 and exec_a == 0:
-                reward -= 1e-3 * (self.step_i / self.episode_steps)
+                    "exec_action": int(exec_a)}
             return self._obs(), reward, True, info
 
         _, x_next_row = self.stores["250ms"].get_row(next_i)
         price_next = self._get_price(x_next_row)
 
-        ret = 0.0
-        if price_now > 0:
-            ret = (price_next - price_now) / price_now
-
-        bal_mid = float(self.balance)
-        if self.pos != 0:
-            pnl = bal_mid * float(LEVERAGE) * float(self.pos) * float(ret)
-            self.balance = bal_mid + pnl
-
         self.balance = max(0.0, float(self.balance))
-        reward = float((self.balance - bal_start) / (bal_start + EPS))
+        if self.balance > self.peak_balance:
+            self.peak_balance = self.balance
+        reward = float(math.log((self.balance + EPS) / (bal_start + EPS)))
 
         self.i = next_i
         self.step_i += 1
+        if int(self.cooldown_remaining) > 0:
+            self.cooldown_remaining -= 1
 
         base_store = self.stores["250ms"]
         t_ms = base_store.ts_of_idx(self.i)
@@ -278,7 +328,7 @@ class TradingEnv:
             if self.torch_obs:
                 self._shift_append_torch(self.tbuf_1h, row1h)
 
-        thresh = float(LOSS_THRESHOLD_FRAC) * float(INIT_BALANCE)
+        thresh = float(LOSS_THRESHOLD_FRAC) * self.peak_balance
         done = False
         if self.balance <= thresh:
             done = True
@@ -286,17 +336,23 @@ class TradingEnv:
             done = True
 
         if done and self.pos != 0:
-            bal_before = float(self.balance)
             self.balance *= self._fee_mult(FEE_CLOSE)
             self.pos = 0
+            self.entry_price = 0.0
+            self.pos_notional = 0.0
+            self.pos_qty = 0.0
             self.balance = max(0.0, float(self.balance))
-            reward += float(self.balance - bal_before)
+            if self.balance > self.peak_balance:
+                self.peak_balance = self.balance
+            reward = float(math.log((self.balance + EPS) / (bal_start + EPS)))
 
         self.done = done
         info = {"balance": float(self.balance), "pos": int(self.pos), 
-                "exec_action": int(self.last_exec)}
-        if self.pos == 0 and exec_a == 0:
-                reward -= 1e-3 * (self.step_i / self.episode_steps)
+                "exec_action": int(exec_a)}
+        if (not done) and self.pos == 0 and exec_a == 0 and \
+                                    self.flat_hold_steps > IDLE_PENALTY_AFTER_STEPS:
+            excess = self.flat_hold_steps - IDLE_PENALTY_AFTER_STEPS
+            reward -= IDLE_PENALTY_BASE * (excess / self.episode_steps)
         return self._obs(), reward, done, info
     
     
