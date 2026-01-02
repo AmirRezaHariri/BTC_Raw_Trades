@@ -906,3 +906,11 @@ def map_base_ts_to_scale_idx(scale_store: ScaleStore, t_ms: int):
     if t_ms < scale_store.first_ts:
         return -1
     return int((int(t_ms) - int(scale_store.first_ts)) // int(scale_store.interval_ms))
+
+def map_base_ts_to_scale_idx_clamped(scale_store: ScaleStore, t_ms: int):
+    idx = map_base_ts_to_scale_idx(scale_store, t_ms)
+    if idx < 0:
+        return -1
+    if idx >= int(scale_store.total_rows):
+        return int(scale_store.total_rows) - 1
+    return int(idx)

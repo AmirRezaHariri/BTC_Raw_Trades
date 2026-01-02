@@ -1,8 +1,8 @@
 import json
 import time
 import random
-import math
 import numpy as np
+import math
 
 import torch
 import torch.nn as nn
@@ -11,7 +11,7 @@ from torch.utils.data import IterableDataset, DataLoader, get_worker_info
 import multiprocessing as mp
 
 from config import *
-from utils import *
+from dataset import *
 from model import *
 from dataset import *
 from env import *
@@ -35,9 +35,11 @@ def build_signature(stores: dict, ctx_dim: int) -> dict:
             "min_hold_steps": int(MIN_HOLD_STEPS),
             "cooldown_steps": int(COOLDOWN_STEPS),
             "trade_penalty_entry": float(TRADE_PENALTY_ENTRY),
-            "idle_penalty_base": float(IDLE_PENALTY_BASE),
-            "after_steps": int(IDLE_PENALTY_AFTER_STEPS),
-            "base": float(IDLE_PENALTY_BASE),
+            "trade_penalty_flip": float(TRADE_PENALTY_FLIP),
+            "pos_hold_penalty": float(POS_HOLD_PENALTY),
+            "pos_fraction": float(POS_FRACTION),
+            "spread_bps": float(SPREAD_BPS),
+            "slippage_bps": float(SLIPPAGE_BPS),
         },
         "model": {
             "hidden": int(HIDDEN),
@@ -46,6 +48,11 @@ def build_signature(stores: dict, ctx_dim: int) -> dict:
         },
         "replay": {"cap": int(REPLAY_CAP)},
         "store_dims": {k: int(stores[k].d) for k in stores.keys()},
+        "alpha": {
+            "alpha_init": float(ALPHA_INIT),
+            "lr_alpha": float(LR_ALPHA),
+            "target_entropy": float(TARGET_ENTROPY) if TARGET_ENTROPY is not None else None,
+        },
     }
 
 
@@ -77,7 +84,7 @@ def select_action(actor: ActorNet, obs, device: str, deterministic: bool = False
 @torch.no_grad()
 def evaluate_policy(actor: nn.Module, stores, norm, start_lo: int, start_hi: int, total_steps: int, device: str):
     actor.eval()
-    env = TradingEnv(stores, norm, close_idx_in_x250=8, device=device, torch_obs=True)
+    env = TradingEnv(stores, norm, close_idx_in_x250=8, device=device, torch_obs=False)
 
     steps = 0
     ep = 0
@@ -293,7 +300,12 @@ def train():
     opt_actor = torch.optim.Adam(actor.parameters(), lr=LR_ACTOR)
     opt_critic = torch.optim.Adam(critic.parameters(), lr=LR_CRITIC)
 
-    log_alpha = torch.tensor(math.log(ALPHA_INIT), device=DEVICE, requires_grad=True)
+    target_entropy = TARGET_ENTROPY
+    if target_entropy is None:
+        # Discrete SAC: reasonable default target entropy.
+        target_entropy = 0.95 * float(math.log(max(2, N_ACTIONS)))
+
+    log_alpha = torch.tensor(math.log(max(1e-8, float(ALPHA_INIT))), device=DEVICE, dtype=torch.float32, requires_grad=True)
     opt_alpha = torch.optim.Adam([log_alpha], lr=LR_ALPHA)
 
     mean = {k: torch.tensor(norm[k]["mean"], device=DEVICE, dtype=torch.float32) for k in norm}
@@ -314,7 +326,7 @@ def train():
     )
     warmup_min_i = first_idx_ge_regular(base_store.first_ts, base_store.interval_ms, base_store.total_rows, req_t)
 
-    env = TradingEnv(stores, norm, close_idx_in_x250=close_idx, device=DEVICE, torch_obs=True)
+    env = TradingEnv(stores, norm, close_idx_in_x250=close_idx, device=DEVICE, torch_obs=False)
     episode_steps = env.episode_steps
 
     def sample_start(lo: int, hi: int):
@@ -363,12 +375,13 @@ def train():
         ns5m  = norm_t("5m", ns5m)
         ns1h  = norm_t("1h", ns1h)
 
-        alpha_det = log_alpha.exp().detach()
+        alpha_det = float(log_alpha.exp().detach().item())
 
         amp_on = (DEVICE == "cuda") and USE_AMP_BF16
         amp_dtype = torch.bfloat16
+        autocast_dev = "cuda" if DEVICE == "cuda" else "cpu"
 
-        with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=amp_on):
+        with torch.autocast(device_type=autocast_dev, dtype=amp_dtype, enabled=amp_on):
             with torch.no_grad():
                 logits_n = actor(ns250, ns20, ns5m, ns1h, nctx)
                 logp_n = F.log_softmax(logits_n, dim=-1)
@@ -391,7 +404,7 @@ def train():
         nn.utils.clip_grad_norm_(critic.parameters(), 5.0)
         opt_critic.step()
 
-        with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=amp_on):
+        with torch.autocast(device_type=autocast_dev, dtype=amp_dtype, enabled=amp_on):
             logits = actor(s250, s20, s5m, s1h, ctx)
             logp = F.log_softmax(logits, dim=-1)
             p = torch.exp(logp)
@@ -409,8 +422,8 @@ def train():
 
         ent = -(p.float() * logp.float()).sum(dim=-1).mean()
 
-        alpha_loss = -(log_alpha * (ent.detach() - float(TARGET_ENTROPY)))
-
+        # Temperature (alpha) tuning to hit target entropy.
+        alpha_loss = (log_alpha * (ent.detach() - float(target_entropy)))
         opt_alpha.zero_grad(set_to_none=True)
         alpha_loss.backward()
         opt_alpha.step()
@@ -435,8 +448,8 @@ def train():
             "critic_tgt": critic_tgt.state_dict(),
             "opt_actor": opt_actor.state_dict(),
             "opt_critic": opt_critic.state_dict(),
-            "opt_alpha": opt_alpha.state_dict(),
             "log_alpha": float(log_alpha.detach().cpu().item()),
+            "opt_alpha": opt_alpha.state_dict(),
             "replay": rb.state_dict(),
             "rng": rng,
         }
@@ -451,20 +464,24 @@ def train():
 
         ckpt = load_checkpoint(Path(ckpt_path), "cpu")
 
-        sig_now = build_signature(stores, ctx_dim)
-        sig_old = ckpt.get("signature", None)
-        if sig_old is None:
-            raise RuntimeError("Checkpoint missing signature")
-        if sig_old != sig_now:
-            raise RuntimeError(f"Checkpoint/config mismatch\nckpt: {sig_old}\nnow:  {sig_now}")
+        # sig_now = build_signature(stores, ctx_dim)
+        # sig_old = ckpt.get("signature", None)
+        # if sig_old is None:
+        #     raise RuntimeError("Checkpoint missing signature")
+        # if sig_old != sig_now:
+        #     raise RuntimeError(f"Checkpoint/config mismatch\nckpt: {sig_old}\nnow:  {sig_now}")
 
         actor.load_state_dict(ckpt["actor"], strict=True)
         critic.load_state_dict(ckpt["critic"], strict=True)
         critic_tgt.load_state_dict(ckpt["critic_tgt"], strict=True)
         opt_actor.load_state_dict(ckpt["opt_actor"])
         opt_critic.load_state_dict(ckpt["opt_critic"])
-        opt_alpha.load_state_dict(ckpt["opt_alpha"])
-        log_alpha.data.fill_(float(ckpt["log_alpha"]))
+
+        if "log_alpha" in ckpt and "opt_alpha" in ckpt:
+            log_alpha.data.fill_(float(ckpt["log_alpha"]))
+            opt_alpha.load_state_dict(ckpt["opt_alpha"])
+        else:
+            raise RuntimeError("Checkpoint missing alpha state (log_alpha/opt_alpha)")
 
         rb.load_state_dict(ckpt["replay"])
 
@@ -496,6 +513,15 @@ def train():
         ep_ent = 0.0
         ep_alpha = 0.0
         ep_updates = 0
+        ep_steps = 0
+        act_counts = np.zeros(N_ACTIONS, dtype=np.int64)
+        trade_opens = 0
+        trade_closes = 0
+        trade_flips = 0
+        hold_steps = 0
+        pos_steps = 0
+        hold_durations = []
+        cur_hold = 0
 
         chunk = 0
         steps_in_ep = 0
@@ -512,6 +538,26 @@ def train():
             next_obs, rwd, done, info = env.step(a_prop)
             exec_a = int(info.get("exec_action", int(a_prop)))
 
+            act_counts[exec_a] += 1
+            ep_steps += 1
+
+            if bool(info.get("trade_opened", False)):
+                trade_opens += 1
+            if bool(info.get("trade_closed", False)):
+                trade_closes += 1
+            if bool(info.get("trade_flipped", False)):
+                trade_flips += 1
+            if exec_a == 0:
+                hold_steps += 1
+                cur_hold += 1
+            else:
+                if cur_hold > 0:
+                    hold_durations.append(cur_hold)
+                    cur_hold = 0
+
+            if env.pos != 0:
+                pos_steps += 1
+
             nctx = next_obs["ctx"].copy()
 
             rb.add(cur_i, exec_a, float(rwd), float(done), ctx, nctx)
@@ -527,11 +573,11 @@ def train():
                     out = update_step()
                     if out is None:
                         break
-                    cl, al, ent, alp = out
+                    cl, al, ent, a_now = out
                     ep_c += cl
                     ep_a += al
                     ep_ent += ent
-                    ep_alpha += alp
+                    ep_alpha += a_now
                     ep_updates += 1
 
             chunk += 1
@@ -546,6 +592,9 @@ def train():
 
             obs = next_obs
             if done:
+                if cur_hold > 0:
+                    hold_durations.append(cur_hold)
+                    cur_hold = 0
                 break
 
         if chunk > 0:
@@ -563,10 +612,38 @@ def train():
             ep_a /= ep_updates
             ep_ent /= ep_updates
             ep_alpha /= ep_updates
+        
+        act_frac = act_counts / max(1, act_counts.sum())
+        avg_hold = float(np.mean(hold_durations)) if hold_durations else 0.0
+        flat_frac = hold_steps / max(1, ep_steps)
+        pos_frac = pos_steps / max(1, ep_steps)
+        avg_r_step = ep_reward / max(1, ep_steps)
+
+        with torch.no_grad():
+            try:
+                qb = next(batch_iter)
+                (s250, s20, s5m, s1h, _, _, _, _, _, _, _, ctxb, _) = qb
+                s250 = s250.to(DEVICE)
+                s20  = s20.to(DEVICE)
+                s5m  = s5m.to(DEVICE)
+                s1h  = s1h.to(DEVICE)
+                ctxb = ctxb.to(DEVICE)
+                q1, q2 = critic(s250, s20, s5m, s1h, ctxb)
+                q = torch.min(q1, q2)
+                q_mean = float(q.abs().mean().item())
+                q_spread = float((q.max(dim=-1).values - q.min(dim=-1).values).mean().item())
+            except Exception:
+                q_mean = 0.0
+                q_spread = 0.0
 
         print(
-            f"episode {ep} steps={steps_in_ep} reward={ep_reward:.4f} bal={env.balance:.2f} "
-            f"critic={ep_c:.4f} actor={ep_a:.4f} ent={ep_ent:.4f} alpha={ep_alpha:.4f}"
+            f"episode {ep} steps={ep_steps} reward={ep_reward:.4f} avg_r={avg_r_step:.6f} "
+            f"bal={env.balance:.2f} critic={ep_c:.4f} actor={ep_a:.4f} ent={ep_ent:.4f} alpha={ep_alpha:.4f} "
+            f"act={act_frac[0]:.2f}/{act_frac[1]:.2f}/{act_frac[2]:.2f}/{act_frac[3]:.2f} "
+            f"trades(o/c/f)={trade_opens}/{trade_closes}/{trade_flips} "
+            f"flat={flat_frac:.2f} pos={pos_frac:.2f} "
+            f"hold_avg={avg_hold:.1f} "
+            f"|Q|={q_mean:.3f} ΔQ={q_spread:.3f}"
         )
 
         if (CKPT_EVERY_EP > 0) and ((ep + 1) % CKPT_EVERY_EP == 0) and (global_step > WARMUP_STEPS):

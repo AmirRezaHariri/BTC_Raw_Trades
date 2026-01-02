@@ -1,6 +1,5 @@
 from pathlib import Path
 import torch
-import math
 
 
 # =========================
@@ -16,7 +15,7 @@ TRADES_DIR = DATA_ROOT / "trades"
 BOOK_DIR = DATA_ROOT / "bookDepth"
 OUT_ROOT = Path("processed") / SYMBOL
 CHECKPOINT_DIR = OUT_ROOT / "checkpoints"
-RESUME = False
+RESUME = True
 
 SEQ_LEN = 256
 BASE_MS = 250
@@ -44,19 +43,39 @@ EPS = 1e-8
 # Environment
 INIT_BALANCE = 100.0
 LEVERAGE = 1
+
+# Use only a fraction of equity for position sizing (reduces always-in-position + fee bleed).
+POS_FRACTION = 1.0
+
+# Transaction cost model beyond explicit fees.
+# 1 bp = 0.0001. These are applied on execution (entry/exit), not just on close.
+SPREAD_BPS = 1.0
+SLIPPAGE_BPS = 0.5
+
 FEE_OPEN = 0.0004
 FEE_CLOSE = 0.0004
 LOSS_THRESHOLD_FRAC = 0.666 # Minimum balance 
-EPISODE_HOURS = 6.0
+EPISODE_HOURS = 1.0
 VOTE_N = 256
 
-MIN_HOLD_STEPS = 80
-COOLDOWN_STEPS = 4
-TRADE_PENALTY_ENTRY = 1e-4
-IDLE_PENALTY_BASE = 1e-5
-IDLE_PENALTY_AFTER_STEPS = 14400
+# Hard throttles to stop churn.
+# BASE_MS=250ms => 4 steps/sec. 2400 steps                                     = 10 minutes.
+MIN_HOLD_STEPS = 240
+COOLDOWN_STEPS = 20
 
-ACTIONS = ["HOLD", "OPEN_LONG", "OPEN_SHORT", "CLOSE"]
+# Explicit churn discouragement in reward space.
+TRADE_PENALTY_ENTRY = 0.0
+TRADE_PENALTY_FLIP = 0.0
+
+# Mild exposure penalty per step to avoid "always in position" when there is no edge.
+POS_HOLD_PENALTY = 1e-8
+
+# Action semantics (IMPORTANT):
+# HOLD = keep current position
+# LONG = target long
+# SHORT = target short
+# FLAT = target flat (close position)
+ACTIONS = ["HOLD", "LONG", "SHORT", "FLAT"]
 N_ACTIONS = len(ACTIONS)
 
 USE_VOTE_FILTER_TRAIN = False
@@ -74,24 +93,24 @@ PREFETCH_FACTOR = 2
 PIN_MEMORY = True
 PERSISTENT_WORKERS = True
 
-GAMMA = 0.99995
+GAMMA = 0.999
 TAU = 0.01
 LR_ACTOR = 1e-4
 LR_CRITIC = 3e-4
 LR_ALPHA = 3e-4
 BATCH_SIZE = 128
 
-ALPHA_INIT = 0.2
-TARGET_ENTROPY = math.log(N_ACTIONS) * 0.6
+ALPHA_INIT = 0.05
+TARGET_ENTROPY = None 
 
-REPLAY_CAP = 1_000_000
+REPLAY_CAP = 500_000
 WARMUP_STEPS = 50_000
 UPDATES_PER_STEP = 1
 UPDATE_EVERY = 2
 MAX_EPISODES = 300
-CKPT_EVERY_EP = 25
-EVAL_EVERY_EP = 25
-EVAL_TOTAL_STEPS = 20_000
+CKPT_EVERY_EP = 10
+EVAL_EVERY_EP = 10
+EVAL_TOTAL_STEPS = 10_000
 
 PBAR_EVERY = 32
 
@@ -100,7 +119,7 @@ HIDDEN = 128
 ENC_HIDDEN = 256
 DROPOUT = 0.1
 
-CTX_BASE = 4  # pos, balance, unrealized
+CTX_BASE = 6  # pos, balance, unrealized, realized, hold_left, cooldown
 CTX_LAST_ACT = N_ACTIONS
 CTX_VOTE = VOTE_N * N_ACTIONS
 
