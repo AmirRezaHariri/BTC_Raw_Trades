@@ -4,6 +4,7 @@
 /data/trades/*
 *.npy
 *.json
+*.pkl
 /processed/BTCUSDT/replay_memmap/*
 logs.txt
 /processed/*
